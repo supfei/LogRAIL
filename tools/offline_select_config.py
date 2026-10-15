@@ -477,13 +477,19 @@ def main() -> None:
     selected = select_config(grid, args.mode)
     selected["stage1_metrics"] = s1m
     selected["wide_runs"] = called_stats
-    # coverage warning for smoke-sized wide runs
+    # Coverage vs δ=0.30 band candidates (not vs all val rows).
+    # Formal wide runs only label band windows; warn if labels < that band size.
     n_eval = int(grid["n_eval"].iloc[0])
     max_cov = int(grid["llm_label_coverage"].max())
-    if max_cov < n_eval:
+    band30 = grid[grid["delta"] >= 0.30 - 1e-12]
+    n_band30 = int(band30["n_cand"].max()) if len(band30) else 0
+    selected["llm_label_coverage"] = max_cov
+    selected["n_eval"] = n_eval
+    selected["n_cand_delta030"] = n_band30
+    if n_band30 > 0 and max_cov < n_band30:
         selected["coverage_warning"] = (
-            f"LLM labels cover {max_cov}/{n_eval} eval windows; "
-            "formal selection needs δ=0.30 wide run over all val candidates."
+            f"LLM labels cover {max_cov}/{n_band30} δ=0.30 band candidates "
+            f"(eval n={n_eval}); wide run incomplete — do not treat as formal freeze."
         )
         selected["selection_notes"].append(selected["coverage_warning"])
 
