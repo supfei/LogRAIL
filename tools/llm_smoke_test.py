@@ -13,22 +13,29 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 import time
+
+_REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if _REPO not in sys.path:
+    sys.path.insert(0, _REPO)
+
+from postprocess.llm_registry import DEFAULT_LLM_KEY, resolve_llm_model  # noqa: E402
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="LLM smoke test")
     ap.add_argument(
         "--model",
-        default=os.path.expanduser("~/lograil/models/Qwen2.5-7B-Instruct"),
-        help="local model dir or HF id",
+        default=DEFAULT_LLM_KEY,
+        help="registry key (qwen|llama), local dir, or HF id",
     )
     ap.add_argument("--max_new_tokens", type=int, default=64)
     ap.add_argument("--prompt", default="Reply with exactly: OK")
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
 
-    model_path = os.path.expanduser(args.model)
+    model_path = resolve_llm_model(args.model)
     print(f"[i] model={model_path}")
     print(f"[i] HF_HUB_OFFLINE={os.environ.get('HF_HUB_OFFLINE')}")
     print(f"[i] TRANSFORMERS_OFFLINE={os.environ.get('TRANSFORMERS_OFFLINE')}")
