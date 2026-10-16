@@ -27,7 +27,7 @@ import math
 import os
 import sys
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 import pandas as pd
 
@@ -296,109 +296,271 @@ def _stage1_metrics(base: pd.DataFrame, gt: pd.DataFrame) -> Dict[str, float]:
     return evalmod._metrics(merged["label"], merged["stage1"])
 
 
-def select_config(grid: pd.DataFrame, mode: str) -> Dict[str, Any]:
-    """Apply experiment-plan §7 selection rules."""
-    unlim = grid[grid["budget"] >= 1.0 - 1e-12].copy()
-    if unlim.empty:
-        raise SystemExit("[x] grid has no unlimited-budget (B=1.0) rows")
+# Selection policies (default remains plan §7).
+POLICY_SECTION7 = "section7"  # tie → smaller k, smaller δ
+POLICY_MAX_F1 = "max_f1"  # within F1-tie band, prefer higher F1 first
+POLICY_NET_GAIN_FIRST = "net_gain_first"  # require net_gain>0 at B=1, then F1
+ALL_POLICIES = (POLICY_SECTION7, POLICY_MAX_F1, POLICY_NET_GAIN_FIRST)
 
+
+def _constraint_pool(
+    unlim: pd.DataFrame, mode: str
+) -> Tuple[pd.DataFrame, str, bool, List[str]]:
+    notes: List[str] = []
     if mode == "precision":
         constrained = unlim[unlim["precision"] >= CONSTRAINT]
         metric_name = "precision"
     else:
         constrained = unlim[unlim["recall"] >= CONSTRAINT]
         metric_name = "recall"
-
     constraint_met = len(constrained) > 0
     pool = constrained if constraint_met else unlim
-
-    best_f1 = float(pool["f1"].max())
-    tied = pool[pool["f1"] >= best_f1 - F1_TIE].copy()
-    # prefer smaller k, then smaller delta
-    tied = tied.sort_values(["k", "delta", "f1"], ascending=[True, True, False])
-    pick_dk = tied.iloc[0]
-    k_sel = int(pick_dk["k"])
-    delta_sel = float(pick_dk["delta"])
-    f1_unlim = float(pick_dk["f1"])
-
-    sub = grid[(grid["k"] == k_sel) & (grid["delta"] == delta_sel)].copy()
-    # budgets that keep F1 within 0.5pp of unlimited
-    ok_b = sub[sub["f1"] >= f1_unlim - F1_TIE].copy()
-    ok_b = ok_b.sort_values(["budget", "f1"], ascending=[True, False])
-    pick_b = ok_b.iloc[0]
-    budget_sel = float(pick_b["budget"])
-
-    selected_row = pick_b.to_dict()
-    net_gain = int(selected_row.get("net_gain", 0))
-    notes = []
     if not constraint_met:
         notes.append(
             f"No (δ,k) met {metric_name}>={CONSTRAINT:.2f} at B=1; fell back to max F1."
         )
-    notes.append(
-        f"Among F1 within {F1_TIE} of best unlimited, chose smallest k then smallest δ."
-    )
-    notes.append(
-        f"Among B with F1 drop <= {F1_TIE} vs B=1, chose smallest B={budget_sel}."
-    )
-    if net_gain <= 0:
-        notes.append("net_gain_warning: net_gain <= 0 (plan fallback condition).")
+    return pool, metric_name, constraint_met, notes
 
-    band = _band_endpoints(mode, float(selected_row["theta"]), delta_sel)
-    return {
+
+def _pick_budget(grid: pd.DataFrame, k_sel: int, delta_sel: float, f1_unlim: float) -> pd.Series:
+    sub = grid[(grid["k"] == k_sel) & (grid["delta"] == delta_sel)].copy()
+    ok_b = sub[sub["f1"] >= f1_unlim - F1_TIE].copy()
+    if ok_b.empty:
+        ok_b = sub.copy()
+    ok_b = ok_b.sort_values(["budget", "f1"], ascending=[True, False])
+    return ok_b.iloc[0]
+
+
+def _pack_selected(
+    mode: str,
+    policy: str,
+    pick_b: Mapping[str, Any],
+    k_sel: int,
+    delta_sel: float,
+    metric_name: str,
+    constraint_met: bool,
+    notes: List[str],
+    *,
+    selected: bool = True,
+    unavailable_reason: Optional[str] = None,
+) -> Dict[str, Any]:
+    budget_sel = float(pick_b["budget"]) if selected else None
+    net_gain = int(pick_b.get("net_gain", 0)) if selected else None
+    band = (
+        _band_endpoints(mode, float(pick_b["theta"]), delta_sel)
+        if selected
+        else {"prob_lo": None, "prob_hi": None}
+    )
+    out: Dict[str, Any] = {
+        "policy": policy,
+        "selected": bool(selected),
         "mode": mode,
-        "theta": float(selected_row["theta"]),
-        "delta": delta_sel,
-        "k": k_sel,
+        "theta": float(pick_b["theta"]) if selected else None,
+        "delta": delta_sel if selected else None,
+        "k": k_sel if selected else None,
         "budget": budget_sel,
-        "budget_unlimited": budget_sel >= 1.0 - 1e-12,
+        "budget_unlimited": (
+            bool(budget_sel is not None and budget_sel >= 1.0 - 1e-12) if selected else None
+        ),
         "prob_lo": band["prob_lo"],
         "prob_hi": band["prob_hi"],
         "constraint_metric": metric_name,
         "constraint_threshold": CONSTRAINT,
         "constraint_met": bool(constraint_met),
         "f1_tie_tol": F1_TIE,
-        "metrics": {
-            "precision": float(selected_row["precision"]),
-            "recall": float(selected_row["recall"]),
-            "f1": float(selected_row["f1"]),
-            "accuracy": float(selected_row["accuracy"]),
-            "n": int(selected_row["n"]),
-            "tp": int(selected_row["tp"]),
-            "fp": int(selected_row["fp"]),
-            "fn": int(selected_row["fn"]),
-            "tn": int(selected_row["tn"]),
-            "n_cand": int(selected_row["n_cand"]),
-            "n_after_budget": int(selected_row["n_after_budget"]),
-            "n_llm_applied": int(selected_row["n_llm_applied"]),
-            "n_missing_llm": int(selected_row["n_missing_llm"]),
-            "flip_count": int(selected_row["flip_count"]),
-            "flip_benefit": int(selected_row["flip_benefit"]),
-            "flip_harm": int(selected_row["flip_harm"]),
-            "net_gain": net_gain,
-            "llm_label_coverage": int(selected_row["llm_label_coverage"]),
-            "n_eval": int(selected_row["n_eval"]),
-        },
-        "net_gain_warning": bool(net_gain <= 0),
+        "net_gain_warning": bool(selected and net_gain is not None and net_gain <= 0),
         "selection_notes": notes,
-        "cli_hints": {
-            "precision": {
-                "call_policy": "pred1_boundary",
-                "base_threshold": float(selected_row["theta"]),
-                "prob_lo": band["prob_lo"],
-                "prob_hi_b": band["prob_hi"],
-                "evidence_k": k_sel,
-                "budget": None if budget_sel >= 1.0 - 1e-12 else budget_sel,
-            },
-            "recall": {
-                "call_policy": "boundary",
-                "prob0_min": band["prob_lo"],
-                "prob0_max": band["prob_hi"],
-                "evidence_k": k_sel,
-                "top_k": 1,
-                "budget": None if budget_sel >= 1.0 - 1e-12 else budget_sel,
-            },
-        }[mode],
+        "unavailable_reason": unavailable_reason,
+    }
+    if not selected:
+        out["metrics"] = None
+        out["cli_hints"] = None
+        return out
+
+    out["metrics"] = {
+        "precision": float(pick_b["precision"]),
+        "recall": float(pick_b["recall"]),
+        "f1": float(pick_b["f1"]),
+        "accuracy": float(pick_b["accuracy"]),
+        "n": int(pick_b["n"]),
+        "tp": int(pick_b["tp"]),
+        "fp": int(pick_b["fp"]),
+        "fn": int(pick_b["fn"]),
+        "tn": int(pick_b["tn"]),
+        "n_cand": int(pick_b["n_cand"]),
+        "n_after_budget": int(pick_b["n_after_budget"]),
+        "n_llm_applied": int(pick_b["n_llm_applied"]),
+        "n_missing_llm": int(pick_b["n_missing_llm"]),
+        "flip_count": int(pick_b["flip_count"]),
+        "flip_benefit": int(pick_b["flip_benefit"]),
+        "flip_harm": int(pick_b["flip_harm"]),
+        "net_gain": int(net_gain),
+        "llm_label_coverage": int(pick_b["llm_label_coverage"]),
+        "n_eval": int(pick_b["n_eval"]),
+    }
+    out["cli_hints"] = {
+        "precision": {
+            "call_policy": "pred1_boundary",
+            "base_threshold": float(pick_b["theta"]),
+            "prob_lo": band["prob_lo"],
+            "prob_hi_b": band["prob_hi"],
+            "evidence_k": k_sel,
+            "budget": None if budget_sel >= 1.0 - 1e-12 else budget_sel,
+        },
+        "recall": {
+            "call_policy": "boundary",
+            "prob0_min": band["prob_lo"],
+            "prob0_max": band["prob_hi"],
+            "evidence_k": k_sel,
+            "top_k": 1,
+            "budget": None if budget_sel >= 1.0 - 1e-12 else budget_sel,
+        },
+    }[mode]
+    return out
+
+
+def select_config(
+    grid: pd.DataFrame, mode: str, policy: str = POLICY_SECTION7
+) -> Dict[str, Any]:
+    """Select (δ,k,B) under one policy. Default is experiment-plan §7."""
+    if policy not in ALL_POLICIES:
+        raise ValueError(f"unknown policy {policy}; expected one of {ALL_POLICIES}")
+
+    unlim = grid[grid["budget"] >= 1.0 - 1e-12].copy()
+    if unlim.empty:
+        raise SystemExit("[x] grid has no unlimited-budget (B=1.0) rows")
+
+    pool, metric_name, constraint_met, notes = _constraint_pool(unlim, mode)
+    notes = list(notes)
+
+    if policy == POLICY_NET_GAIN_FIRST:
+        pos = pool[pool["net_gain"] > 0].copy()
+        if pos.empty:
+            notes.append(
+                "net_gain_first: no (δ,k) with net_gain>0 at B=1 under constraint pool; "
+                "no config selected (do not freeze for test)."
+            )
+            # Still return a stub for comparison tables.
+            dummy = pool.sort_values("f1", ascending=False).iloc[0].to_dict()
+            return _pack_selected(
+                mode,
+                policy,
+                dummy,
+                int(dummy["k"]),
+                float(dummy["delta"]),
+                metric_name,
+                constraint_met,
+                notes,
+                selected=False,
+                unavailable_reason="no_positive_net_gain_at_B1",
+            )
+        pool = pos
+        notes.append("net_gain_first: restricted to net_gain>0 at B=1 before F1 ranking.")
+
+    best_f1 = float(pool["f1"].max())
+    tied = pool[pool["f1"] >= best_f1 - F1_TIE].copy()
+
+    if policy == POLICY_SECTION7:
+        # Plan §7: among near-ties, prefer smaller k then smaller δ.
+        tied = tied.sort_values(["k", "delta", "f1"], ascending=[True, True, False])
+        notes.append(
+            f"section7: among F1 within {F1_TIE} of best, chose smallest k then smallest δ."
+        )
+    elif policy == POLICY_MAX_F1:
+        # Prefer higher F1 inside the near-tie band; break remaining ties by smaller k, δ.
+        tied = tied.sort_values(["f1", "k", "delta"], ascending=[False, True, True])
+        notes.append(
+            f"max_f1: among F1 within {F1_TIE} of best, prefer higher F1, then smaller k/δ."
+        )
+    else:  # POLICY_NET_GAIN_FIRST — same F1 ranking as section7 after net_gain filter
+        tied = tied.sort_values(
+            ["f1", "k", "delta"], ascending=[False, True, True]
+        )
+        notes.append(
+            f"net_gain_first: among net_gain>0 and F1 within {F1_TIE} of best, "
+            "prefer higher F1 then smaller k/δ."
+        )
+
+    pick_dk = tied.iloc[0]
+    k_sel = int(pick_dk["k"])
+    delta_sel = float(pick_dk["delta"])
+    f1_unlim = float(pick_dk["f1"])
+
+    pick_b = _pick_budget(grid, k_sel, delta_sel, f1_unlim)
+    # For net_gain_first, also require final budgeted row net_gain>0 when possible.
+    if policy == POLICY_NET_GAIN_FIRST:
+        sub = grid[(grid["k"] == k_sel) & (grid["delta"] == delta_sel)].copy()
+        ok_b = sub[
+            (sub["f1"] >= f1_unlim - F1_TIE) & (sub["net_gain"] > 0)
+        ].copy()
+        if ok_b.empty:
+            notes.append(
+                "net_gain_first: no budget keeps net_gain>0 with F1 drop tolerance; "
+                "no config selected."
+            )
+            return _pack_selected(
+                mode,
+                policy,
+                pick_dk.to_dict(),
+                k_sel,
+                delta_sel,
+                metric_name,
+                constraint_met,
+                notes,
+                selected=False,
+                unavailable_reason="no_positive_net_gain_under_budget",
+            )
+        pick_b = ok_b.sort_values(["budget", "f1"], ascending=[True, False]).iloc[0]
+        notes.append(
+            f"net_gain_first: among B with net_gain>0 and F1 drop <= {F1_TIE}, "
+            f"chose smallest B={float(pick_b['budget'])}."
+        )
+    else:
+        notes.append(
+            f"Among B with F1 drop <= {F1_TIE} vs B=1, chose smallest B={float(pick_b['budget'])}."
+        )
+
+    selected_row = pick_b.to_dict()
+    net_gain = int(selected_row.get("net_gain", 0))
+    if net_gain <= 0:
+        notes.append("net_gain_warning: net_gain <= 0 (plan fallback condition).")
+
+    return _pack_selected(
+        mode,
+        policy,
+        selected_row,
+        k_sel,
+        delta_sel,
+        metric_name,
+        constraint_met,
+        notes,
+        selected=True,
+    )
+
+
+def select_all_policies(grid: pd.DataFrame, mode: str) -> Dict[str, Any]:
+    """Run §7 + two trial policies; §7 remains the primary freeze candidate."""
+    by_policy = {p: select_config(grid, mode, policy=p) for p in ALL_POLICIES}
+    summary_rows = []
+    for p, cfg in by_policy.items():
+        row = {
+            "policy": p,
+            "selected": cfg.get("selected"),
+            "delta": cfg.get("delta"),
+            "k": cfg.get("k"),
+            "budget": cfg.get("budget"),
+            "constraint_met": cfg.get("constraint_met"),
+            "net_gain_warning": cfg.get("net_gain_warning"),
+            "unavailable_reason": cfg.get("unavailable_reason"),
+        }
+        m = cfg.get("metrics") or {}
+        for key in ("precision", "recall", "f1", "net_gain", "n_llm_applied"):
+            row[key] = m.get(key)
+        summary_rows.append(row)
+    return {
+        "primary_policy": POLICY_SECTION7,
+        "policies": by_policy,
+        "comparison": summary_rows,
     }
 
 
@@ -474,24 +636,37 @@ def main() -> None:
         }
 
     grid = run_grid(args.mode, base, gt, llm_by_k, args.theta, deltas, budgets)
-    selected = select_config(grid, args.mode)
+    multi = select_all_policies(grid, args.mode)
+    selected = multi["policies"][POLICY_SECTION7]
     selected["stage1_metrics"] = s1m
     selected["wide_runs"] = called_stats
+    selected["policy_variants"] = {
+        p: multi["policies"][p] for p in ALL_POLICIES if p != POLICY_SECTION7
+    }
     # Coverage vs δ=0.30 band candidates (not vs all val rows).
     # Formal wide runs only label band windows; warn if labels < that band size.
     n_eval = int(grid["n_eval"].iloc[0])
     max_cov = int(grid["llm_label_coverage"].max())
     band30 = grid[grid["delta"] >= 0.30 - 1e-12]
     n_band30 = int(band30["n_cand"].max()) if len(band30) else 0
-    selected["llm_label_coverage"] = max_cov
-    selected["n_eval"] = n_eval
-    selected["n_cand_delta030"] = n_band30
+    coverage_meta = {
+        "llm_label_coverage": max_cov,
+        "n_eval": n_eval,
+        "n_cand_delta030": n_band30,
+    }
+    for cfg in multi["policies"].values():
+        cfg.update(coverage_meta)
+        cfg["stage1_metrics"] = s1m
+        cfg["wide_runs"] = called_stats
     if n_band30 > 0 and max_cov < n_band30:
-        selected["coverage_warning"] = (
+        warn = (
             f"LLM labels cover {max_cov}/{n_band30} δ=0.30 band candidates "
             f"(eval n={n_eval}); wide run incomplete — do not treat as formal freeze."
         )
-        selected["selection_notes"].append(selected["coverage_warning"])
+        for cfg in multi["policies"].values():
+            cfg["coverage_warning"] = warn
+            cfg.setdefault("selection_notes", []).append(warn)
+        selected["coverage_warning"] = warn
 
     out_dir = Path(os.path.expanduser(args.out_dir))
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -499,21 +674,55 @@ def main() -> None:
     grid.to_csv(grid_path, index=False)
     cfg_path = out_dir / "selected_config.json"
     cfg_path.write_text(json.dumps(selected, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    compare_path = out_dir / "selection_compare.json"
+    compare_path.write_text(
+        json.dumps(
+            {
+                "primary_policy": POLICY_SECTION7,
+                "comparison": multi["comparison"],
+                "policies": multi["policies"],
+                "stage1_metrics": s1m,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    for p in (POLICY_MAX_F1, POLICY_NET_GAIN_FIRST):
+        p_path = out_dir / f"selected_config_{p}.json"
+        p_path.write_text(
+            json.dumps(multi["policies"][p], ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
     readme = out_dir / "README_offline.txt"
     readme.write_text(
         "Offline selection from greedy δ=0.30 wide-run labels.\n"
         "Do not reuse labels across different evidence_k.\n"
-        "Use same theta and split as the wide run. Formal freeze requires full-val coverage.\n",
+        "Use same theta and split as the wide run. Formal freeze requires full-val coverage.\n"
+        "\n"
+        "Policies:\n"
+        f"  - {POLICY_SECTION7} (primary / selected_config.json): plan §7; "
+        "F1 near-tie -> smaller k then smaller δ.\n"
+        f"  - {POLICY_MAX_F1}: F1 near-tie -> higher F1 first.\n"
+        f"  - {POLICY_NET_GAIN_FIRST}: require net_gain>0 then F1; may be unavailable.\n"
+        "See selection_compare.json for side-by-side results.\n",
         encoding="utf-8",
     )
 
     print(f"[✓] wrote {grid_path}  rows={len(grid)}")
-    print(f"[✓] wrote {cfg_path}")
-    print(
-        f"[✓] selected mode={args.mode} δ={selected['delta']} k={selected['k']} "
-        f"B={selected['budget']} F1={selected['metrics']['f1']:.4f} "
-        f"constraint_met={selected['constraint_met']} net_gain={selected['metrics']['net_gain']}"
-    )
+    print(f"[✓] wrote {cfg_path}  (primary={POLICY_SECTION7})")
+    print(f"[✓] wrote {compare_path}")
+    for row in multi["comparison"]:
+        if row["selected"]:
+            print(
+                f"[✓] policy={row['policy']}: δ={row['delta']} k={row['k']} "
+                f"B={row['budget']} F1={row['f1']:.4f} net_gain={row['net_gain']}"
+            )
+        else:
+            print(
+                f"[w] policy={row['policy']}: unavailable ({row['unavailable_reason']})"
+            )
     if selected.get("coverage_warning"):
         print(f"[w] {selected['coverage_warning']}")
 
