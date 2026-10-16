@@ -82,6 +82,33 @@ with torch.no_grad():
         preds.extend((ps >= args.threshold).int().cpu().tolist())
         probs.extend(ps.cpu().tolist())
 
+# --- Resolve window_ids (prefer split_manifest global ids) ---
+window_ids = list(range(len(preds)))
+manifest_path = os.path.join(NPZ, "split_manifest.csv")
+if os.path.exists(manifest_path):
+    try:
+        import pandas as pd
+
+        man = pd.read_csv(manifest_path)
+        ids = []
+        for s in requested:
+            part = man[man["split"] == s]
+            if "split_local_idx" in part.columns:
+                part = part.sort_values("split_local_idx")
+            else:
+                part = part.sort_values("window_id")
+            ids.extend(part["window_id"].astype(int).tolist())
+        if len(ids) == len(preds):
+            window_ids = ids
+            print(f"[i] window_id from {manifest_path} for splits={requested}")
+        else:
+            print(
+                f"[w] split_manifest length {len(ids)} != preds {len(preds)}; "
+                "falling back to 0..n-1"
+            )
+    except Exception as e:
+        print(f"[w] failed to read split_manifest ({e}); falling back to 0..n-1")
+
 # --- Save predictions ---
 out_dir = os.path.dirname(args.out)
 if out_dir:
@@ -89,7 +116,7 @@ if out_dir:
 with open(args.out, "w", newline="", encoding="utf-8") as fw:
     wr = csv.writer(fw)
     wr.writerow(["window_id", "is_anomaly_pred", "prob"])
-    for i, (p, s) in enumerate(zip(preds, probs)):
-        wr.writerow([i, p, s])
+    for wid, p, s in zip(window_ids, preds, probs):
+        wr.writerow([wid, p, s])
 
 print(f"[✓] Saved predictions → {args.out}")
